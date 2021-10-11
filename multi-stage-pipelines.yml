@@ -1,0 +1,175 @@
+# Starter pipeline
+# Start with a minimal pipeline that you can customize to build and deploy your code.
+# Add steps that build, run tests, deploy, and more:
+# https://aka.ms/yaml
+
+# variables used: 
+# SolutionName
+# MajorVersion, MinorVersion, Revision
+# UpgradeTestSolution, UpgradeProdSolution
+
+name: $(MajorVersion).$(MinorVersion).$(Revision).$(Build.BuildId)
+
+trigger: none
+
+pool:
+  vmImage: windows-latest
+
+stages:
+
+- stage: export_solution
+  displayName: Export Solution
+  jobs:
+  - job:
+    steps:
+    - task: PowerPlatformToolInstaller@0
+      inputs:
+        DefaultVersion: true
+    - task: PowerPlatformExportSolution@0
+      displayName: Export $(SolutionName)
+      inputs:
+        authenticationType: 'PowerPlatformSPN'
+        PowerPlatformSPN: 'Dev'
+        SolutionName: '$(SolutionName)'
+        SolutionOutputFile: '$(Build.BinariesDirectory)/$(SolutionName)_unmanaged.zip'
+        AsyncOperation: true
+        MaxAsyncWaitTime: '60'
+    - task: PowerPlatformUnpackSolution@0
+      inputs:
+        SolutionInputFile: '$(Build.BinariesDirectory)/$(SolutionName)_unmanaged.zip'
+        SolutionTargetFolder: '$(Build.SourcesDirectory)/$(SolutionName)'
+    - task: PowerShell@2
+      inputs:
+        targetType: 'inline'
+        script: |
+          $solutionName = "$(SolutionName)"
+          cd $(Build.SourcesDirectory)
+          git config user.email "export.pipeline@dev.azure.com"
+          git config user.name "Export Pipeline"
+          git checkout $(Build.SourceBranchName)
+    - task: PowerShell@2
+      inputs:
+        targetType: 'inline'
+        script: |
+          cd $(Build.SourcesDirectory)
+          git add --all
+          git commit -m "Updated $(SolutionName) configuration changes during build $(Build.BuildNumber)"
+          git -c http.extraheader="AUTHORIZATION: bearer $(System.AccessToken)" push
+
+- stage: build_solution
+  displayName: Build Solution
+  jobs:
+  - job:
+    steps:
+    - task: PowerShell@2
+      inputs:
+        targetType: 'inline'
+        script: |
+          $solutionName = "$(SolutionName)"
+          cd $(Build.SourcesDirectory)
+          git config user.email "export.pipeline@dev.azure.com"
+          git config user.name "Export Pipeline"
+          git checkout $(Build.SourceBranchName)
+    - task: PowerPlatformToolInstaller@0
+      inputs:
+        DefaultVersion: true
+    - task: PowerPlatformPackSolution@0
+      inputs:
+        SolutionSourceFolder: '$(Build.SourcesDirectory)/$(SolutionName)'
+        SolutionOutputFile: '$(Build.BinariesDirectory)/$(SolutionName).zip'
+    - task: PowerPlatformChecker@0
+      inputs:
+        PowerPlatformSPN: 'Build'
+        FilesToAnalyze: '$(Build.BinariesDirectory)/$(SolutionName).zip'
+        RuleSet: '0ad12346-e108-40b8-a956-9a8f95ea18c9'
+    - task: PowerPlatformImportSolution@0
+      inputs:
+        authenticationType: 'PowerPlatformSPN'
+        PowerPlatformSPN: 'Build'
+        SolutionInputFile: '$(Build.BinariesDirectory)/$(SolutionName).zip'
+        AsyncOperation: true
+        MaxAsyncWaitTime: '60'
+    - task: PowerPlatformSetSolutionVersion@0
+      inputs:
+        authenticationType: 'PowerPlatformSPN'
+        PowerPlatformSPN: 'Build'
+        SolutionName: '$(SolutionName)'
+        SolutionVersionNumber: '$(Build.BuildNumber)'
+    - task: PowerPlatformExportSolution@0
+      inputs:
+        authenticationType: 'PowerPlatformSPN'
+        PowerPlatformSPN: 'Build'
+        SolutionName: '$(SolutionName)'
+        SolutionOutputFile: '$(Build.ArtifactStagingDirectory)/$(SolutionName).zip'
+        Managed: true
+        AsyncOperation: true
+        MaxAsyncWaitTime: '60'
+    - task: PublishBuildArtifacts@1
+      inputs:
+        PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+        ArtifactName: 'drop'
+        publishLocation: 'Container'
+
+- stage: deploy_to_test
+  displayName: Deploy to Test
+  jobs:
+  - deployment: ${{ variables.SolutionName }}
+    displayName: ${{ variables.SolutionName }}
+    environment:
+      name: 'test-env'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: PowerPlatformToolInstaller@0
+            inputs:
+              DefaultVersion: true
+          - task: PowerPlatformImportSolution@0
+            inputs:
+              authenticationType: 'PowerPlatformSPN'
+              PowerPlatformSPN: 'Test'
+              SolutionInputFile: '$(Pipeline.Workspace)/drop/$(SolutionName).zip'
+              AsyncOperation: true
+              MaxAsyncWaitTime: '60'
+              HoldingSolution: $(UpgradeTestSolution)
+              OverwriteUnmanagedCustomizations: true
+          - task: PowerPlatformApplySolutionUpgrade@0
+            condition: and(succeeded(), eq(variables.UpgradeTestSolution, 'true'))
+            inputs:
+              authenticationType: 'PowerPlatformSPN'
+              PowerPlatformSPN: 'Test'
+              SolutionName: '$(SolutionName)'
+              AsyncOperation: true
+              MaxAsyncWaitTime: '60'
+
+- stage: deploy_to_production
+  displayName: Deploy to Production
+  jobs:
+  - deployment: ${{ variables.SolutionName }}
+    displayName: ${{ variables.SolutionName }}
+    environment:
+      name: 'prod-env'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: PowerPlatformToolInstaller@0
+            inputs:
+              DefaultVersion: true
+          - task: PowerPlatformImportSolution@0
+            inputs:
+              authenticationType: 'PowerPlatformSPN'
+              PowerPlatformSPN: 'Prod'
+              SolutionInputFile: '$(Pipeline.Workspace)/drop/$(SolutionName).zip'
+              AsyncOperation: true
+              MaxAsyncWaitTime: '60'
+              HoldingSolution: $(UpgradeProdSolution)
+              OverwriteUnmanagedCustomizations: true
+          - task: PowerPlatformApplySolutionUpgrade@0
+            condition: and(succeeded(), eq(variables.UpgradeProdSolution, 'true'))
+            inputs:
+              authenticationType: 'PowerPlatformSPN'
+              PowerPlatformSPN: 'Prod'
+              SolutionName: '$(SolutionName)'
+              AsyncOperation: true
+              MaxAsyncWaitTime: '60'
